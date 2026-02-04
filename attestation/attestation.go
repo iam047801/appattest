@@ -10,9 +10,10 @@ import (
 	"encoding/base64"
 	"fmt"
 
+	"github.com/ugorji/go/codec"
+
 	"github.com/bas-d/appattest/authenticator"
 	"github.com/bas-d/appattest/utils"
-	"github.com/ugorji/go/codec"
 )
 
 const APPLE_ROOT_CERT = `-----BEGIN CERTIFICATE-----
@@ -146,10 +147,17 @@ func verifyAttestation(att AttestationObject, clientDataHash, keyID []byte) ([]b
 		return nil, nil, utils.ErrAttestationCertificate.WithDetails(fmt.Sprintf("Error parsing certificate from ASN.1 data: %+v", err))
 	}
 
+	// Verify the certificate has the Apple App Attest EKU (1.2.840.113635.100.4.24).
+	appAttestEKU := asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 4, 24}
+	if !hasExtendedKeyUsage(credCert, appAttestEKU) {
+		return nil, nil, utils.ErrAttestationCertificate.WithDetails("Certificate missing Apple App Attest Extended Key Usage")
+	}
+
 	// Create verification options.
 	verifyOptions := x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
 
 	// 1. Verify that the x5c array contains the intermediate and leaf certificates for App Attest,
@@ -204,4 +212,15 @@ func verifyAttestation(att AttestationObject, clientDataHash, keyID []byte) ([]b
 
 	// Return x963-encoded public key and receipt.
 	return publicKeyBytes, receipt, nil
+}
+
+// hasExtendedKeyUsage checks if the certificate contains the specified EKU OID
+func hasExtendedKeyUsage(cert *x509.Certificate, oid asn1.ObjectIdentifier) bool {
+	// Check in UnknownExtKeyUsage for custom OIDs not recognized by Go
+	for _, eku := range cert.UnknownExtKeyUsage {
+		if eku.Equal(oid) {
+			return true
+		}
+	}
+	return false
 }
