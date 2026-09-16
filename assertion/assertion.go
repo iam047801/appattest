@@ -40,7 +40,9 @@ func (aar *AuthenticatorAssertionResponse) Verify(storedChallenge string, relyin
 	clientDataHash := sha256.Sum256(aar.RawClientData)
 
 	// 2. Concatenate authenticatorData and clientDataHash and apply a SHA256 hash over the result to form nonce.
-	nonceData := append(a.RawAuthenticatorData, clientDataHash[:]...)
+	nonceData := make([]byte, 0, len(a.RawAuthenticatorData)+len(clientDataHash))
+	nonceData = append(nonceData, a.RawAuthenticatorData...)
+	nonceData = append(nonceData, clientDataHash[:]...)
 	nonce := sha256.Sum256(nonceData)
 
 	// 3. Use the public key that you stored from the attestation object to verify that the assertion’s signature is valid for nonce.

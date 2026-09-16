@@ -9,7 +9,39 @@ import (
 	"github.com/ugorji/go/codec"
 )
 
-var minAuthDataLength = 37
+const (
+	// minAuthDataLength is the size of the fixed portion of the authenticator
+	// data: a 32 byte RP ID hash, a flags byte and a four byte counter.
+	minAuthDataLength = 37
+	// aaguidLength is the size of the AAGUID in the attested credential data.
+	aaguidLength = 16
+	// attestedCredDataOffset is where the attested credential data starts, when present.
+	attestedCredDataOffset = minAuthDataLength
+	// credentialIDLenOffset is where the two byte credential ID length prefix starts.
+	credentialIDLenOffset = attestedCredDataOffset + aaguidLength
+	// credentialIDOffset is where the credential ID itself starts.
+	credentialIDOffset = credentialIDLenOffset + 2
+)
+
+// The two AAGUIDs App Attest uses. Step 8 of Apple's validation procedure
+// requires the attested credential data to carry one of them, depending on the
+// environment the attestation was produced in.
+//
+// These are deliberately not exported. They are slices, so an exported one could
+// be overwritten by any importer, and step 8 would then compare against whatever
+// it had been changed to.
+var (
+	// aaguidProduction is "appattest" followed by seven 0x00 bytes.
+	aaguidProduction = appAttestAAGUID("appattest")
+	// aaguidDevelopment is "appattestdevelop".
+	aaguidDevelopment = appAttestAAGUID("appattestdevelop")
+)
+
+func appAttestAAGUID(name string) []byte {
+	aaguid := make([]byte, aaguidLength)
+	copy(aaguid, name)
+	return aaguid
+}
 
 // Authenticators respond to Relying Party requests by returning an object derived from the
 // AuthenticatorResponse interface. See §5.2. Authenticator Responses
@@ -38,7 +70,13 @@ type AuthenticatorData struct {
 	Flags    AuthenticatorFlags     `json:"flags"`
 	Counter  uint32                 `json:"sign_count"`
 	AttData  AttestedCredentialData `json:"att_data"`
-	ExtData  []byte                 `json:"ext_data"`
+	// ExtData holds the raw CBOR bytes of the extension map, as they appeared in
+	// the authenticator data. It is nil when no extension data was present.
+	ExtData []byte `json:"ext_data"`
+	// Extensions holds the decoded extension map. It is nil when no extension
+	// data was present, which is the case for every authenticator predating
+	// iOS 27 and its sibling releases.
+	Extensions *Extensions `json:"extensions,omitempty"`
 }
 
 type AttestedCredentialData struct {
@@ -157,39 +195,116 @@ func (a *AuthenticatorData) Unmarshal(rawAuthData []byte) error {
 	a.Flags = AuthenticatorFlags(rawAuthData[32])
 	a.Counter = binary.BigEndian.Uint32(rawAuthData[33:37])
 
-	remaining := len(rawAuthData) - minAuthDataLength
+	offset := minAuthDataLength
 
-	// Apple didn't read the W3C specification properly and sets the attestedCredentialData flag, while it's not present for an assertion. We'll just look a the length...
-	if len(rawAuthData) > minAuthDataLength {
-		a.unmarshalAttestedData(rawAuthData)
-		attDataLen := len(a.AttData.AAGUID) + 2 + len(a.AttData.CredentialID) + len(a.AttData.CredentialPublicKey)
-		remaining = remaining - attDataLen
+	// The flags byte cannot be used to work out what follows, in either direction:
+	//
+	//   - Apple sets AT on assertions, which never carry attested credential
+	//     data. On iOS 27 an assertion is 99 bytes with flags 0xc0, so keying off
+	//     AT, or off the data merely being longer than 37 bytes, would read the
+	//     extension map as an AAGUID and a credential ID length.
+	//   - Apple leaves ED clear on the attestation in its own validation guide,
+	//     even though that attestation carries 62 bytes of extension data, so ED
+	//     cannot be used to detect extensions either.
+	//
+	// The attested credential data is therefore detected by the fixed AAGUID that
+	// App Attest is required to use, which is the one unambiguous marker available.
+	if isAppAttestAAGUID(rawAuthData[offset:]) {
+		consumed, err := a.unmarshalAttestedData(rawAuthData)
+		if err != nil {
+			return err
+		}
+		offset = consumed
 	}
 
-	if remaining != 0 {
-		return utils.ErrBadRequest.WithDetails("Leftover bytes decoding AuthenticatorData")
+	if offset < len(rawAuthData) {
+		if err := a.unmarshalExtensions(rawAuthData[offset:]); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// If Attestation Data is present, unmarshall that into the appropriate public key structure
-func (a *AuthenticatorData) unmarshalAttestedData(rawAuthData []byte) {
-	a.AttData.AAGUID = rawAuthData[37:53]
-	idLength := binary.BigEndian.Uint16(rawAuthData[53:55])
-	a.AttData.CredentialID = rawAuthData[55 : 55+idLength]
-	a.AttData.CredentialPublicKey = unmarshalCredentialPublicKey(rawAuthData[55+idLength:])
+// isAppAttestAAGUID reports whether b starts with one of the App Attest AAGUIDs.
+func isAppAttestAAGUID(b []byte) bool {
+	if len(b) < aaguidLength {
+		return false
+	}
+	return bytes.Equal(b[:aaguidLength], aaguidProduction) ||
+		bytes.Equal(b[:aaguidLength], aaguidDevelopment)
 }
 
-// Unmarshall the credential's Public Key into CBOR encoding
-func unmarshalCredentialPublicKey(keyBytes []byte) []byte {
+// If Attestation Data is present, unmarshall that into the appropriate public key
+// structure. It returns the offset just past the attested credential data.
+func (a *AuthenticatorData) unmarshalAttestedData(rawAuthData []byte) (int, error) {
+	if len(rawAuthData) < credentialIDOffset {
+		return 0, utils.ErrBadRequest.WithDetails(
+			fmt.Sprintf("Authenticator data too short for attested credential data. Expected at least %d bytes. Got %d bytes\n", credentialIDOffset, len(rawAuthData)))
+	}
+
+	a.AttData.AAGUID = rawAuthData[attestedCredDataOffset:credentialIDLenOffset]
+
+	idLength := int(binary.BigEndian.Uint16(rawAuthData[credentialIDLenOffset:credentialIDOffset]))
+	if len(rawAuthData)-credentialIDOffset < idLength {
+		return 0, utils.ErrBadRequest.WithDetails(
+			fmt.Sprintf("Authenticator data too short for the announced credential ID length of %d bytes\n", idLength))
+	}
+	a.AttData.CredentialID = rawAuthData[credentialIDOffset : credentialIDOffset+idLength]
+
+	keyOffset := credentialIDOffset + idLength
+	key, consumed, err := unmarshalCredentialPublicKey(rawAuthData[keyOffset:])
+	if err != nil {
+		return 0, utils.ErrBadRequest.WithDetails(fmt.Sprintf("Error decoding the credential public key: %v\n", err))
+	}
+	a.AttData.CredentialPublicKey = key
+
+	return keyOffset + consumed, nil
+}
+
+// Unmarshall the credential's Public Key into CBOR encoding. It returns the key
+// exactly as it appeared in keyBytes alongside its length, which is what any data
+// following the key is located by.
+func unmarshalCredentialPublicKey(keyBytes []byte) ([]byte, int, error) {
 	var cborHandler codec.Handle = new(codec.CborHandle)
+
+	// The key is decoded to validate it and, via the decoder's cursor, to measure
+	// it. The bytes handed back are the original ones: re-encoding the decoded
+	// value would emit the COSE map entries in Go map iteration order, so the
+	// result would differ from the input, and from itself between parses.
 	var m interface{}
-	codec.NewDecoderBytes(keyBytes, cborHandler).Decode(&m)
-	var rawBytes []byte
-	enc := codec.NewEncoderBytes(&rawBytes, cborHandler)
-	enc.Encode(m)
-	return rawBytes
+	dec := codec.NewDecoderBytes(keyBytes, cborHandler)
+	if err := dec.Decode(&m); err != nil {
+		return nil, 0, err
+	}
+	consumed := dec.NumBytesRead()
+
+	return keyBytes[:consumed], consumed, nil
+}
+
+// unmarshalExtensions decodes the trailing CBOR extension map.
+//
+// The map has to account for every remaining byte. Anything else means the
+// authenticator data was not parsed the way its producer wrote it, and carrying
+// on would mean reporting values read out of a structure that was not understood.
+func (a *AuthenticatorData) unmarshalExtensions(extBytes []byte) error {
+	var cborHandler codec.Handle = new(codec.CborHandle)
+
+	var m map[string]interface{}
+	dec := codec.NewDecoderBytes(extBytes, cborHandler)
+	if err := dec.Decode(&m); err != nil {
+		return utils.ErrBadRequest.WithDetails(
+			fmt.Sprintf("Leftover bytes decoding AuthenticatorData: %d trailing bytes are neither an extension map nor a recognised AAGUID: %v\n", len(extBytes), err))
+	}
+	if consumed := int(dec.NumBytesRead()); consumed != len(extBytes) {
+		return utils.ErrBadRequest.WithDetails(
+			fmt.Sprintf("Leftover bytes decoding AuthenticatorData: extension map used %d of %d trailing bytes\n", consumed, len(extBytes)))
+	}
+
+	a.ExtData = extBytes
+	a.Extensions = parseExtensions(m)
+
+	return nil
 }
 
 // ResidentKeyRequired - Require that the key be private key resident to the client device
@@ -218,14 +333,12 @@ func (a *AuthenticatorData) Verify(appIDHash []byte, credentialId []byte, produc
 
 	// 8. Verify that the authenticator data’s aaguid field is either appattestdevelop if operating in the development environment,
 	// or appattest followed by seven 0x00 bytes if operating in the production environment.
-	aaguid := make([]byte, 16)
+	aaguid := aaguidDevelopment
 	if production {
-		copy(aaguid, []byte("appattest"))
-	} else {
-		copy(aaguid, []byte("appattestdevelop"))
+		aaguid = aaguidProduction
 	}
 	if !bytes.Equal(a.AttData.AAGUID, aaguid) {
-		return utils.ErrVerification.WithDetails("AAGUID was not appattestdevelop\n")
+		return utils.ErrVerification.WithDetails(fmt.Sprintf("AAGUID was not %s\n", bytes.TrimRight(aaguid, "\x00")))
 	}
 
 	// 9. Verify that the authenticator data’s credentialId field is the same as the key identifier.

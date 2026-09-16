@@ -97,8 +97,14 @@ func (aar *AuthenticatorAttestationResponse) parse() (*AttestationObject, error)
 		return nil, fmt.Errorf("error decoding auth data: %v", err)
 	}
 
+	// The AT flag is checked for conformance, but it is not what the presence of
+	// attested credential data is decided by: Apple sets AT on assertions too.
+	// See authenticator.AuthenticatorData.Unmarshal.
 	if !a.AuthData.Flags.HasAttestedCredentialData() {
 		return nil, utils.ErrAttestationFormat.WithDetails("Attestation missing attested credential data flag")
+	}
+	if len(a.AuthData.AttData.AAGUID) == 0 {
+		return nil, utils.ErrAttestationFormat.WithDetails("Attestation missing attested credential data")
 	}
 
 	return &a, nil
@@ -168,7 +174,9 @@ func verifyAttestation(att AttestationObject, clientDataHash, keyID []byte) ([]b
 
 	// 2. Create clientDataHash as the SHA256 hash of the one-time challenge sent to your app before performing the attestation,
 	// and append that hash to the end of the authenticator data (authData from the decoded object).
-	nonceData := append(att.RawAuthData, clientDataHash...)
+	nonceData := make([]byte, 0, len(att.RawAuthData)+len(clientDataHash))
+	nonceData = append(nonceData, att.RawAuthData...)
+	nonceData = append(nonceData, clientDataHash...)
 
 	// 3. Generate a new SHA256 hash of the composite item to create nonce.
 	nonce := sha256.Sum256(nonceData)
